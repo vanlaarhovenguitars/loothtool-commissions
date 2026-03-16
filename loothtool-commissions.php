@@ -83,11 +83,24 @@ function lt_comm_run_compat_checks() {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			return;
 		}
-		echo '<div class="notice notice-error"><p><strong>LT Commissions — Compatibility Warning</strong></p><ul>';
+		echo '<div class="notice notice-error"><p><strong>LT Commissions — Compatibility Warning</strong></p>';
+		echo '<ul>';
 		foreach ( $issues as $msg ) {
-			echo '<li>' . esc_html( $msg ) . '</li>';
+			echo '<li><strong>' . esc_html( $msg ) . '</strong></li>';
 		}
-		echo '</ul><p>Check the PHP error log and test order processing before dismissing.</p></div>';
+		echo '</ul>';
+		echo '<p><strong>Do not process new orders until you have completed these steps:</strong></p>';
+		echo '<ol style="list-style:decimal;margin-left:20px;line-height:1.8">';
+		echo '<li>Check the Dokan changelog for anything mentioning <em>commission</em>, <em>vendor balance</em>, or <em>order processing</em>.</li>';
+		echo '<li>SSH into the server and check the PHP error log for related errors:<br><code>sudo tail -100 /opt/bitnami/php/logs/php-fpm.log | grep -i "dokan\|lt_comm\|vendor_balance"</code></li>';
+		echo '<li>Place a test order on the staging site using a test payment method.</li>';
+		echo '<li>Verify the commission calculated correctly by running the reprocess script on that order:<br><code>sudo /opt/bitnami/php/bin/php /tmp/reprocess_ORDER_ID.php</code></li>';
+		echo '<li>Check WP Admin &rarr; LT Commissions to confirm the vendor payout figure is correct.</li>';
+		echo '<li>If everything looks right, update <code>LT_COMM_DOKAN_TESTED_MAJOR</code> in <code>loothtool-commissions.php</code> to the new major version number to clear this notice.</li>';
+		echo '<li>If something is broken, <strong>do not update the constant</strong> — this notice will keep showing as a reminder. Roll back Dokan via WP Admin &rarr; Plugins if needed.</li>';
+		echo '</ol>';
+		echo '<p style="color:#888;font-size:12px">This message is also recorded in the PHP error log with the prefix <code>[LT Commissions] COMPAT WARNING</code>.</p>';
+		echo '</div>';
 	} );
 }
 
