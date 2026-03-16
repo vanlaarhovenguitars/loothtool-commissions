@@ -1,12 +1,12 @@
 <?php
 /**
- * Vendor Dashboard — Dokan "Earnings" tab.
+ * Vendor Dashboard — Dokan "Earnings Preview" tab.
  *
- * Shows vendors their commission breakdown per order:
- *  - Item subtotal (the base)
- *  - Their earnings
- *  - Platform commission
- *  - Excluded amounts (shipping, tax, fees)
+ * Shows vendors:
+ *  - Their per-product earnings estimate (price × vendor %)
+ *  - Commission rate breakdown (vendor cut vs platform cut)
+ *  - How payment method fees work (fees never affect vendor earnings)
+ *  - A quick earnings calculator
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -40,105 +40,186 @@ class LT_Comm_Vendor_Dashboard {
 	}
 
 	public static function render() {
-		$vendor_id = get_current_user_id();
+		$vendor_id    = get_current_user_id();
 		if ( ! $vendor_id ) return;
 
-		// Fetch this vendor's orders that have been commission-calculated.
-		$orders = wc_get_orders( [
-			'meta_key'   => '_lt_comm_calculated_at',
-			'meta_value' => '', // any non-empty value
-			'meta_compare' => '!=',
-			'limit'      => 50,
-			'orderby'    => 'date',
-			'order'      => 'DESC',
-			'meta_query' => [
-				'relation' => 'AND',
-				[
-					'key'     => '_dokan_vendor_id',
-					'value'   => $vendor_id,
-					'compare' => '=',
-					'type'    => 'NUMERIC',
-				],
-				[
-					'key'     => '_lt_comm_calculated_at',
-					'compare' => 'EXISTS',
-				],
-			],
+		$platform_pct = (float) get_option( 'lt_comm_platform_percentage', 10.0 );
+		$vendor_pct   = 100.0 - $platform_pct;
+
+		// Payment method fee schedules (informational only — never deducted from vendor earnings).
+		$payment_methods = [
+			'Credit / Debit Card (Stripe)' => [ 'pct' => 2.9,  'flat' => 0.30 ],
+			'PayPal'                        => [ 'pct' => 3.49, 'flat' => 0.49 ],
+			'ACH / Bank Transfer'           => [ 'pct' => 0.8,  'flat' => 0.00, 'cap' => 5.00 ],
+		];
+
+		// Fetch vendor's published products.
+		$products = wc_get_products( [
+			'author'  => $vendor_id,
+			'status'  => 'publish',
+			'limit'   => 200,
+			'orderby' => 'title',
+			'order'   => 'ASC',
 		] );
 
-		// Monthly summary.
-		$this_month_earn = 0.0;
-		$all_time_earn   = 0.0;
-		$month_start     = strtotime( 'first day of this month midnight' );
-
-		foreach ( $orders as $order ) {
-			$earn = (float) $order->get_meta( '_lt_comm_vendor_earnings' );
-			$all_time_earn += $earn;
-			$order_ts = $order->get_date_created() ? $order->get_date_created()->getTimestamp() : 0;
-			if ( $order_ts >= $month_start ) {
-				$this_month_earn += $earn;
-			}
-		}
-
 		dokan_get_template_part( 'global/dokan-dashboard-header', '', [
-			'header' => __( 'My Earnings', 'loothtool-commissions' ),
+			'header' => __( 'Earnings Preview', 'loothtool-commissions' ),
 		] );
 		?>
 		<div class="dokan-dashboard-wrap">
 			<?php do_action( 'dokan_dashboard_content_before' ); ?>
 			<div class="dokan-dashboard-content dokan-earnings-content">
-
 				<article>
-					<div class="entry-header">
-						<h3>Commission Breakdown</h3>
-					</div>
 
-					<div class="dokan-w6" style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:24px">
-						<div class="dokan-panel dokan-panel-default" style="flex:1;min-width:200px">
-							<div class="dokan-panel-heading"><strong>This Month</strong></div>
-							<div class="dokan-panel-body" style="font-size:1.6rem;font-weight:700;padding:16px">
-								<?php echo wp_kses_post( wc_price( $this_month_earn ) ); ?>
-							</div>
+					<!-- ── Commission rate banner ── -->
+					<div style="background:#1a3a3c;border:1px solid #2d6063;border-radius:6px;padding:16px 20px;margin-bottom:24px;display:flex;gap:32px;flex-wrap:wrap;align-items:center">
+						<div style="text-align:center;min-width:100px">
+							<div style="font-size:2rem;font-weight:700;color:#2ecc71"><?php echo esc_html( number_format( $vendor_pct, 0 ) ); ?>%</div>
+							<div style="font-size:12px;color:#aaa;margin-top:2px">Your Cut</div>
 						</div>
-						<div class="dokan-panel dokan-panel-default" style="flex:1;min-width:200px">
-							<div class="dokan-panel-heading"><strong>All Time</strong></div>
-							<div class="dokan-panel-body" style="font-size:1.6rem;font-weight:700;padding:16px">
-								<?php echo wp_kses_post( wc_price( $all_time_earn ) ); ?>
-							</div>
+						<div style="text-align:center;min-width:100px">
+							<div style="font-size:2rem;font-weight:700;color:#e74c3c"><?php echo esc_html( number_format( $platform_pct, 0 ) ); ?>%</div>
+							<div style="font-size:12px;color:#aaa;margin-top:2px">Platform Cut</div>
+						</div>
+						<div style="flex:1;min-width:200px;font-size:13px;color:#ccc;line-height:1.6">
+							<strong style="color:#fff">Commissions are based on item price only.</strong><br>
+							Shipping charged to the buyer, sales tax, and payment processing fees are <strong>never deducted</strong> from your earnings — the platform absorbs those costs separately.
 						</div>
 					</div>
 
-					<?php if ( empty( $orders ) ) : ?>
-						<p>No commission data yet. Your earnings will appear here once orders are processed.</p>
+					<!-- ── Per-product earnings table ── -->
+					<h3 style="margin:0 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Your Product Earnings</h3>
+
+					<?php if ( empty( $products ) ) : ?>
+						<p>No published products found.</p>
 					<?php else : ?>
-					<table class="dokan-table dokan-table-striped">
+					<div style="overflow-x:auto">
+					<table class="dokan-table dokan-table-striped" style="width:100%;font-size:13px">
 						<thead>
 							<tr>
-								<th>Order</th>
-								<th>Date</th>
-								<th>Item Subtotal</th>
-								<th>Your Earnings</th>
-								<th>Platform Cut</th>
-								<th>Excl. Shipping</th>
-								<th>Excl. Tax</th>
+								<th style="text-align:left">Product</th>
+								<th style="text-align:right">Sale Price</th>
+								<th style="text-align:right">Your Earnings<br><span style="font-weight:400;color:#aaa">(<?php echo esc_html( number_format( $vendor_pct, 0 ) ); ?>%)</span></th>
+								<th style="text-align:right">Platform Cut<br><span style="font-weight:400;color:#aaa">(<?php echo esc_html( number_format( $platform_pct, 0 ) ); ?>%)</span></th>
+								<th style="text-align:left;color:#aaa">Commission Rule</th>
 							</tr>
 						</thead>
 						<tbody>
-						<?php foreach ( $orders as $order ) : ?>
+						<?php foreach ( $products as $product ) :
+							$pid   = $product->get_id();
+							$rules = LT_Comm_Split_Rules::get_for_product( $pid, $vendor_id );
+							$is_custom = (bool) get_post_meta( $pid, '_lt_comm_override_enabled', true );
+
+							// Figure out vendor's pct and any flat amounts from rules.
+							$vendor_rule_pct  = 0.0;
+							$vendor_rule_flat = 0.0;
+							foreach ( $rules as $rule ) {
+								$is_mine = ( $rule['payee_type'] === 'vendor' && ( (int) $rule['payee_id'] === 0 || (int) $rule['payee_id'] === $vendor_id ) );
+								if ( ! $is_mine ) continue;
+								if ( $rule['type'] === 'percentage' ) $vendor_rule_pct  += (float) $rule['value'];
+								else                                   $vendor_rule_flat += (float) $rule['value'];
+							}
+
+							// Price range.
+							if ( $product->is_type( 'variable' ) ) {
+								$min = (float) $product->get_variation_price( 'min' );
+								$max = (float) $product->get_variation_price( 'max' );
+								$price_html   = wc_price( $min ) . ( $min !== $max ? ' – ' . wc_price( $max ) : '' );
+								$earn_min     = round( $min * $vendor_rule_pct / 100 + $vendor_rule_flat, 2 );
+								$earn_max     = round( $max * $vendor_rule_pct / 100 + $vendor_rule_flat, 2 );
+								$earn_html    = wc_price( $earn_min ) . ( $earn_min !== $earn_max ? ' – ' . wc_price( $earn_max ) : '' );
+								$plat_min     = round( $min - $earn_min, 2 );
+								$plat_max     = round( $max - $earn_max, 2 );
+								$plat_html    = wc_price( $plat_min ) . ( $plat_min !== $plat_max ? ' – ' . wc_price( $plat_max ) : '' );
+							} else {
+								$price        = (float) $product->get_price();
+								$price_html   = wc_price( $price );
+								$earn_val     = round( $price * $vendor_rule_pct / 100 + $vendor_rule_flat, 2 );
+								$earn_html    = wc_price( $earn_val );
+								$plat_html    = wc_price( round( $price - $earn_val, 2 ) );
+							}
+						?>
 							<tr>
-								<td><a href="<?php echo esc_url( $order->get_view_order_url() ); ?>">#<?php echo esc_html( $order->get_order_number() ); ?></a></td>
-								<td><?php echo esc_html( $order->get_date_created() ? $order->get_date_created()->date( 'M j, Y' ) : '—' ); ?></td>
-								<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_item_subtotal' ) ) ); ?></td>
-								<td style="font-weight:700"><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_vendor_earnings' ) ) ); ?></td>
-								<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_platform_earnings' ) ) ); ?></td>
-								<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_shipping_total' ) ) ); ?></td>
-								<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_tax_total' ) ) ); ?></td>
+								<td>
+									<a href="<?php echo esc_url( get_edit_post_link( $pid ) ); ?>" style="font-weight:600"><?php echo esc_html( $product->get_name() ); ?></a>
+								</td>
+								<td style="text-align:right"><?php echo wp_kses_post( $price_html ); ?></td>
+								<td style="text-align:right;font-weight:700;color:#2ecc71"><?php echo wp_kses_post( $earn_html ); ?></td>
+								<td style="text-align:right;color:#e74c3c"><?php echo wp_kses_post( $plat_html ); ?></td>
+								<td style="color:#aaa;font-size:12px"><?php echo $is_custom ? '<span style="color:#c9a84c">Custom split</span>' : 'Global default'; ?></td>
 							</tr>
 						<?php endforeach; ?>
 						</tbody>
 					</table>
-					<p style="font-size:12px;color:#888;margin-top:8px">Showing last 50 orders. All earnings are calculated on item subtotal only.</p>
+					</div>
 					<?php endif; ?>
+
+					<!-- ── Payment method info ── -->
+					<h3 style="margin:32px 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Payment Method Fees</h3>
+					<p style="font-size:13px;color:#ccc;margin-bottom:12px">
+						These fees are <strong>paid by the platform</strong> — they are never deducted from your earnings. Your payout is always based on the table above regardless of how the buyer checks out.
+					</p>
+					<div style="overflow-x:auto">
+					<table class="dokan-table" style="width:100%;max-width:600px;font-size:13px">
+						<thead>
+							<tr>
+								<th style="text-align:left">Payment Method</th>
+								<th style="text-align:right">Fee Structure</th>
+								<th style="text-align:right;color:#aaa">Example: $50 sale</th>
+								<th style="text-align:right;color:#aaa">Example: $100 sale</th>
+							</tr>
+						</thead>
+						<tbody>
+						<?php foreach ( $payment_methods as $method => $fee ) :
+							$fee50  = isset( $fee['cap'] ) ? min( round( 50  * $fee['pct'] / 100 + $fee['flat'], 2 ), $fee['cap'] ) : round( 50  * $fee['pct'] / 100 + $fee['flat'], 2 );
+							$fee100 = isset( $fee['cap'] ) ? min( round( 100 * $fee['pct'] / 100 + $fee['flat'], 2 ), $fee['cap'] ) : round( 100 * $fee['pct'] / 100 + $fee['flat'], 2 );
+							$fee_label = $fee['pct'] . '%' . ( $fee['flat'] > 0 ? ' + $' . number_format( $fee['flat'], 2 ) : '' );
+							if ( isset( $fee['cap'] ) ) $fee_label .= ' (max $' . number_format( $fee['cap'], 2 ) . ')';
+						?>
+							<tr>
+								<td><?php echo esc_html( $method ); ?></td>
+								<td style="text-align:right;color:#aaa"><?php echo esc_html( $fee_label ); ?></td>
+								<td style="text-align:right;color:#aaa">$<?php echo esc_html( number_format( $fee50, 2 ) ); ?></td>
+								<td style="text-align:right;color:#aaa">$<?php echo esc_html( number_format( $fee100, 2 ) ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+						</tbody>
+					</table>
+					</div>
+					<p style="font-size:11px;color:#666;margin-top:8px">Fee rates shown are approximate. Your earnings are not affected by these fees.</p>
+
+					<!-- ── Quick calculator ── -->
+					<h3 style="margin:32px 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Quick Earnings Calculator</h3>
+					<div style="background:#1a3a3c;border:1px solid #2d6063;border-radius:6px;padding:16px 20px;max-width:400px">
+						<label style="display:block;margin-bottom:8px;font-size:13px;color:#ccc">Enter a sale price:</label>
+						<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+							<span style="color:#aaa;font-size:16px">$</span>
+							<input type="number" id="lt-earn-calc-input" min="0" step="0.01" placeholder="0.00"
+								style="width:120px;padding:6px 10px;border:1px solid #2d6063;border-radius:4px;background:#0d2527;color:#fff;font-size:15px">
+						</div>
+						<div style="font-size:13px;line-height:2">
+							<div>Your earnings <strong style="color:#2ecc71">(<?php echo esc_html( number_format( $vendor_pct, 0 ) ); ?>%):</strong>
+								<strong id="lt-earn-result" style="color:#2ecc71;margin-left:8px">—</strong></div>
+							<div style="color:#aaa">Platform cut <span>(<?php echo esc_html( number_format( $platform_pct, 0 ) ); ?>%):</span>
+								<span id="lt-plat-result" style="margin-left:8px">—</span></div>
+						</div>
+					</div>
+					<script>
+					(function(){
+						var input = document.getElementById('lt-earn-calc-input');
+						var earnEl = document.getElementById('lt-earn-result');
+						var platEl = document.getElementById('lt-plat-result');
+						var vPct = <?php echo esc_js( $vendor_pct ); ?>;
+						var pPct = <?php echo esc_js( $platform_pct ); ?>;
+						if (!input) return;
+						input.addEventListener('input', function(){
+							var v = parseFloat(this.value);
+							if (isNaN(v) || v <= 0) { earnEl.textContent = '—'; platEl.textContent = '—'; return; }
+							earnEl.textContent = '$' + (v * vPct / 100).toFixed(2);
+							platEl.textContent = '$' + (v * pPct / 100).toFixed(2);
+						});
+					}());
+					</script>
 
 				</article>
 			</div><!-- .dokan-dashboard-content -->

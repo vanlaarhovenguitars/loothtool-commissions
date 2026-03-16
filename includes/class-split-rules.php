@@ -23,26 +23,38 @@ class LT_Comm_Split_Rules {
 	 * Falls back to the global default if no per-product rules exist.
 	 *
 	 * @param  int   $product_id
+	 * @param  int   $vendor_id   Optional. When provided, per-vendor rate is used for the default.
 	 * @return array
 	 */
-	public static function get_for_product( $product_id ) {
+	public static function get_for_product( $product_id, $vendor_id = 0 ) {
 		if ( ! get_post_meta( $product_id, '_lt_comm_override_enabled', true ) ) {
-			return self::get_global_default();
+			return self::get_global_default( $vendor_id );
 		}
 		$raw = get_post_meta( $product_id, self::META_KEY, true );
 		if ( is_array( $raw ) && ! empty( $raw ) ) {
 			return $raw;
 		}
-		return self::get_global_default();
+		return self::get_global_default( $vendor_id );
 	}
 
 	/**
 	 * Global default split: vendor gets (100 - platform_pct)%, platform gets platform_pct%.
 	 * payee_id 0 for vendor = resolved at runtime to the product's vendor.
+	 *
+	 * @param  int $vendor_id  Optional. When provided, checks per-vendor rate override.
 	 */
-	public static function get_global_default() {
+	public static function get_global_default( $vendor_id = 0 ) {
 		$platform_pct = (float) get_option( 'lt_comm_platform_percentage', 10.0 );
-		$vendor_pct   = 100.0 - $platform_pct;
+
+		// Per-vendor rate override.
+		if ( $vendor_id > 0 ) {
+			$custom = get_user_meta( $vendor_id, '_lt_comm_vendor_platform_pct', true );
+			if ( $custom !== '' ) {
+				$platform_pct = (float) $custom;
+			}
+		}
+
+		$vendor_pct = 100.0 - $platform_pct;
 		return [
 			[
 				'payee_type' => 'vendor',

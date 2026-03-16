@@ -71,6 +71,12 @@ class LT_Comm_Commission_Calculator {
 	 * @return float
 	 */
 	public static function override_global_percentage( $percentage, $vendor_id ) {
+		if ( $vendor_id > 0 ) {
+			$custom = get_user_meta( $vendor_id, '_lt_comm_vendor_platform_pct', true );
+			if ( $custom !== '' ) {
+				return (float) $custom;
+			}
+		}
 		return (float) get_option( 'lt_comm_platform_percentage', 10.0 );
 	}
 }
