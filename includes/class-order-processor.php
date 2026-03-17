@@ -8,14 +8,16 @@
  *  - Write a full audit trail to order meta.
  *
  * Audit meta written per order:
- *  _lt_comm_item_subtotal      float   Base used for all commission math
- *  _lt_comm_shipping_total     float   Excluded from commission base (audit only)
- *  _lt_comm_tax_total          float   Excluded from commission base (audit only)
- *  _lt_comm_processing_fees    float   Sum of WC fee line items (platform keeps these)
- *  _lt_comm_splits             array   Per-line-item breakdown
- *  _lt_comm_vendor_earnings    float   Amount Dokan will pay the primary vendor
- *  _lt_comm_platform_earnings  float   Loothtool's total take
- *  _lt_comm_calculated_at      string  ISO 8601 timestamp
+ *  _lt_comm_item_subtotal          float   Base used for all commission math
+ *  _lt_comm_shipping_total         float   Excluded from commission base (audit only)
+ *  _lt_comm_tax_total              float   Excluded from commission base (audit only)
+ *  _lt_comm_processing_fees        float   Sum of WC fee line items (platform keeps these)
+ *  _lt_comm_splits                 array   Per-line-item breakdown
+ *  _lt_comm_vendor_earnings        float   Amount Dokan will pay the primary vendor
+ *  _lt_comm_platform_earnings      float   Loothtool's total take
+ *  _lt_comm_calculated_at          string  ISO 8601 timestamp
+ *  _lt_comm_cross_vendor_payouts   array   Secondary vendor credits written to dokan_vendor_balance
+ *                                          Each entry: { vendor_id, vendor_name, amount, credited_at }
  */
 
 defined( 'ABSPATH' ) || exit;
@@ -37,6 +39,13 @@ class LT_Comm_Order_Processor {
 
 		// Also process on order status change (catches manual orders / admin edits).
 		add_action( 'woocommerce_order_status_changed', [ __CLASS__, 'on_status_change' ], 10, 3 );
+
+		// Late balance correction — runs after ALL Dokan hooks have finished
+		// so our calculated payout survives Dokan's own balance writes.
+		add_action( 'woocommerce_order_status_changed', [ __CLASS__, 'correct_vendor_balance' ], 999, 3 );
+
+		// Cross-vendor commissions are tracked in order meta only (Option C):
+		// admin pays out manually at month end. No Dokan balance rows needed.
 	}
 
 	/**
@@ -82,11 +91,67 @@ class LT_Comm_Order_Processor {
 		if ( ! $order || $order->get_meta( '_lt_comm_calculated_at' ) ) {
 			return;
 		}
-		$vendor_id = (int) get_post_meta( $order_id, '_dokan_vendor_id', true );
+		$vendor_id = (int) $order->get_meta( '_dokan_vendor_id' );
 		if ( ! $vendor_id ) {
 			return;
 		}
 		self::process_order( $vendor_id, $order );
+	}
+
+	/**
+	 * Late balance correction — runs at priority 999 on woocommerce_order_status_changed,
+	 * which fires AFTER woocommerce_order_status_processing (where Dokan inserts/updates
+	 * its balance rows). Reads the already-calculated _lt_comm_vendor_payout from meta
+	 * and overwrites Dokan's balance row so the vendor payout matches our split.
+	 */
+	public static function correct_vendor_balance( $order_id, $old_status, $new_status ) {
+		if ( ! in_array( $new_status, [ 'processing', 'completed' ], true ) ) {
+			return;
+		}
+		$order = wc_get_order( $order_id );
+		if ( ! $order ) {
+			return;
+		}
+		$vendor_payout = $order->get_meta( '_lt_comm_vendor_payout' );
+		if ( ! $vendor_payout && $vendor_payout !== 0 ) {
+			return;
+		}
+		$vendor_id = (int) $order->get_meta( '_dokan_vendor_id' );
+		if ( ! $vendor_id ) {
+			return;
+		}
+		global $wpdb;
+
+		// Correct the balance table (used for withdrawals).
+		$wpdb->update(
+			$wpdb->prefix . 'dokan_vendor_balance',
+			[ 'debit' => (float) $vendor_payout ],
+			[ 'trn_id' => $order_id, 'vendor_id' => $vendor_id, 'trn_type' => 'dokan_orders' ],
+			[ '%f' ],
+			[ '%d', '%d', '%s' ]
+		);
+
+		// Correct the order stats table (analytics/reporting).
+		$platform_earnings = (float) $order->get_meta( '_lt_comm_platform_earnings' );
+		$wpdb->update(
+			$wpdb->prefix . 'dokan_order_stats',
+			[
+				'vendor_earning'    => (float) $vendor_payout,
+				'admin_commission'  => $platform_earnings,
+			],
+			[ 'order_id' => $order_id ],
+			[ '%f', '%f' ],
+			[ '%d' ]
+		);
+
+		// Correct the dokan_orders table (vendor dashboard "Earning" column).
+		$wpdb->update(
+			$wpdb->prefix . 'dokan_orders',
+			[ 'net_amount' => (float) $vendor_payout ],
+			[ 'order_id' => $order_id ],
+			[ '%f' ],
+			[ '%d' ]
+		);
 	}
 
 	/**
@@ -125,6 +190,7 @@ class LT_Comm_Order_Processor {
 		$all_splits          = [];
 		$total_vendor_earn   = 0.0;
 		$total_platform_earn = 0.0;
+		$cross_vendor_totals = []; // payee_id => total amount
 
 		foreach ( $order->get_items( 'line_item' ) as $item_id => $item ) {
 			$product_id = (int) $item->get_product_id();
@@ -144,10 +210,13 @@ class LT_Comm_Order_Processor {
 					$total_platform_earn += $split['amount'];
 				} elseif ( (int) $split['payee_id'] === (int) $vendor_id ) {
 					$total_vendor_earn += $split['amount'];
+				} else {
+					// Cross-vendor split — accumulate for secondary payout.
+					$payee_id = (int) $split['payee_id'];
+					if ( $payee_id > 0 ) {
+						$cross_vendor_totals[ $payee_id ] = ( $cross_vendor_totals[ $payee_id ] ?? 0.0 ) + $split['amount'];
+					}
 				}
-				// Cross-vendor splits (designer ≠ fulfiller) are recorded in
-				// audit trail; Dokan sub-order payouts handle only the primary
-				// vendor. Secondary payees are settled via admin payout queue.
 			}
 		}
 
@@ -195,20 +264,114 @@ class LT_Comm_Order_Processor {
 			);
 			$order->add_order_note( $note );
 		}
+
+		// ── 8. Credit secondary (cross-vendor) payees ────────────────────────
+		if ( ! empty( $cross_vendor_totals ) ) {
+			self::credit_cross_vendor_payees( $order, $vendor_id, $cross_vendor_totals );
+		}
+	}
+
+	/**
+	 * Record cross-vendor commission payouts in order meta.
+	 *
+	 * Cross-vendor payees are tracked here only — admin pays them out manually
+	 * at month end via the LT Commissions → Cross-Vendor Payouts report.
+	 * No Dokan balance rows are written; this keeps us fully isolated from
+	 * Dokan's internal balance/withdrawal system.
+	 *
+	 * @param WC_Order $order
+	 * @param int      $primary_vendor_id
+	 * @param array    $cross_vendor_totals  payee_id => float amount
+	 */
+	private static function credit_cross_vendor_payees( WC_Order $order, $primary_vendor_id, array $cross_vendor_totals ) {
+		// Skip if already recorded (idempotent on reprocess).
+		if ( $order->get_meta( '_lt_comm_cross_vendor_payouts' ) ) {
+			return;
+		}
+
+		$recorded = [];
+
+		foreach ( $cross_vendor_totals as $payee_id => $amount ) {
+			$payee_id = (int) $payee_id;
+			$amount   = round( (float) $amount, 2 );
+			if ( $amount < 0.01 ) {
+				continue;
+			}
+
+			$vendor_data = get_userdata( $payee_id );
+			$vendor_name = $vendor_data ? $vendor_data->display_name : "Vendor #{$payee_id}";
+
+			$recorded[] = [
+				'vendor_id'   => $payee_id,
+				'vendor_name' => $vendor_name,
+				'amount'      => $amount,
+				'recorded_at' => gmdate( 'c' ),
+				'paid'        => false,
+			];
+
+			if ( get_option( 'lt_comm_audit_log_enabled' ) ) {
+				$order->add_order_note( sprintf(
+					'LT Commissions: cross-vendor commission %s owed to %s (vendor #%d) — pending manual payout.',
+					wc_price( $amount ),
+					esc_html( $vendor_name ),
+					$payee_id
+				) );
+			}
+		}
+
+		if ( ! empty( $recorded ) ) {
+			$order->update_meta_data( '_lt_comm_cross_vendor_payouts', $recorded );
+			$order->save();
+		}
 	}
 
 	/**
 	 * Calculate the payment gateway processing fee for an order.
 	 *
-	 * Most gateways (Stripe, PayPal) never add fee line items to WC orders,
-	 * so we calculate based on published rates per payment method.
+	 * For Dokan sub-orders the actual Stripe/PayPal charge happens on the
+	 * parent order — one fixed component ($0.30 / $0.49) per transaction,
+	 * not per vendor. We compute the real fee on the parent total and then
+	 * prorate each sub-order's share proportionally so the fixed component
+	 * is split fairly instead of duplicated.
+	 *
+	 * @param  WC_Order $order
+	 * @return float
+	 */
+	public static function calculate_gateway_fee( WC_Order $order ) : float {
+		$parent_id = $order->get_parent_id();
+
+		// Not a sub-order — calculate directly.
+		if ( ! $parent_id ) {
+			return self::calculate_raw_gateway_fee( $order );
+		}
+
+		// Sub-order: compute the fee on the parent and prorate.
+		$parent = wc_get_order( $parent_id );
+		if ( ! $parent ) {
+			return self::calculate_raw_gateway_fee( $order );
+		}
+
+		$parent_total = (float) $parent->get_total();
+		if ( $parent_total <= 0 ) {
+			return 0.0;
+		}
+
+		$parent_fee   = self::calculate_raw_gateway_fee( $parent );
+		$sub_total    = (float) $order->get_total();
+		$share        = $sub_total / $parent_total;
+
+		return round( $parent_fee * $share, 2 );
+	}
+
+	/**
+	 * Raw fee calculation on a single order total — no sub-order awareness.
 	 *
 	 * Rates current as of 2026. Update here if Stripe/PayPal change pricing.
 	 *
 	 * @param  WC_Order $order
 	 * @return float
 	 */
-	public static function calculate_gateway_fee( WC_Order $order ) : float {
+	private static function calculate_raw_gateway_fee( WC_Order $order ) : float {
 		$method = $order->get_payment_method();
 		$total  = (float) $order->get_total();
 

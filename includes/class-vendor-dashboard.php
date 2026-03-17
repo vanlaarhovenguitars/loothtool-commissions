@@ -5,7 +5,7 @@
  * Shows vendors:
  *  - Their per-product earnings estimate (price × vendor %)
  *  - Commission rate breakdown (vendor cut vs platform cut)
- *  - How payment method fees work (fees never affect vendor earnings)
+ *  - How payment method fees work (deducted from vendor payout)
  *  - A quick earnings calculator
  */
 
@@ -43,10 +43,16 @@ class LT_Comm_Vendor_Dashboard {
 		$vendor_id    = get_current_user_id();
 		if ( ! $vendor_id ) return;
 
+		$user = wp_get_current_user();
+		if ( ! array_intersect( [ 'seller', 'vendor', 'administrator' ], (array) $user->roles ) ) {
+			echo '<p>You do not have permission to view this page.</p>';
+			return;
+		}
+
 		$platform_pct = (float) get_option( 'lt_comm_platform_percentage', 10.0 );
 		$vendor_pct   = 100.0 - $platform_pct;
 
-		// Payment method fee schedules (informational only — never deducted from vendor earnings).
+		// Payment method fee schedules (deducted from vendor payout after commission split).
 		$payment_methods = [
 			'Credit / Debit Card (Stripe)' => [ 'pct' => 2.9,  'flat' => 0.30 ],
 			'PayPal'                        => [ 'pct' => 3.49, 'flat' => 0.49 ],
@@ -83,7 +89,7 @@ class LT_Comm_Vendor_Dashboard {
 						</div>
 						<div style="flex:1;min-width:200px;font-size:13px;color:#ccc;line-height:1.6">
 							<strong style="color:#fff">Commissions are based on item price only.</strong><br>
-							Shipping charged to the buyer, sales tax, and payment processing fees are <strong>never deducted</strong> from your earnings — the platform absorbs those costs separately.
+							Shipping and sales tax are not included in the commission calculation. Payment processing fees (Stripe, PayPal, etc.) are <strong>deducted from your payout</strong> — see breakdown below.
 						</div>
 					</div>
 
@@ -157,7 +163,7 @@ class LT_Comm_Vendor_Dashboard {
 					<!-- ── Payment method info ── -->
 					<h3 style="margin:32px 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Payment Method Fees</h3>
 					<p style="font-size:13px;color:#ccc;margin-bottom:12px">
-						These fees are <strong>paid by the platform</strong> — they are never deducted from your earnings. Your payout is always based on the table above regardless of how the buyer checks out.
+						These fees are charged by payment processors and are <strong>deducted from your payout</strong> after your commission is calculated. The table below shows approximate rates by payment method.
 					</p>
 					<div style="overflow-x:auto">
 					<table class="dokan-table" style="width:100%;max-width:600px;font-size:13px">
@@ -186,9 +192,98 @@ class LT_Comm_Vendor_Dashboard {
 						</tbody>
 					</table>
 					</div>
-					<p style="font-size:11px;color:#666;margin-top:8px">Fee rates shown are approximate. Your earnings are not affected by these fees.</p>
+					<p style="font-size:11px;color:#666;margin-top:8px">Fee rates shown are approximate and may vary. These fees are deducted from your payout, not from the commission split shown above.</p>
 
-					<!-- ── Quick calculator ── -->
+					<!-- ── Cross-vendor commissions ── -->
+				<?php
+				// Query orders with cross-vendor payouts; wc_get_orders() handles HPOS.
+				$cv_order_ids = wc_get_orders( [
+					'limit'      => -1,
+					'return'     => 'ids',
+					'meta_query' => [ [ 'key' => '_lt_comm_cross_vendor_payouts', 'compare' => 'EXISTS' ] ],
+				] );
+				$cv_entries = [];
+				foreach ( $cv_order_ids as $oid ) {
+					$o_obj   = wc_get_order( (int) $oid );
+					$payouts = $o_obj ? $o_obj->get_meta( '_lt_comm_cross_vendor_payouts' ) : null;
+					if ( ! is_array( $payouts ) ) continue;
+					foreach ( $payouts as $p ) {
+						if ( (int) $p['vendor_id'] !== $vendor_id ) continue;
+						$o = wc_get_order( (int) $oid );
+						if ( ! $o ) continue;
+						$cv_entries[] = [
+							'order_id'     => (int) $oid,
+							'amount'       => (float) $p['amount'],
+							'recorded_at'  => $p['recorded_at'] ?? '',
+							'paid'         => ! empty( $p['paid'] ),
+							'order_status' => $o->get_status(),
+						];
+					}
+				}
+				usort( $cv_entries, fn( $a, $b ) => strcmp( $b['recorded_at'], $a['recorded_at'] ) );
+				if ( ! empty( $cv_entries ) ) :
+					$total_paid    = 0.0;
+					$total_pending = 0.0;
+					foreach ( $cv_entries as $e ) {
+						if ( $e['paid'] ) $total_paid += $e['amount'];
+						else $total_pending += $e['amount'];
+					}
+				?>
+				<h3 style="margin:32px 0 8px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Cross-Vendor Commissions</h3>
+				<p style="font-size:13px;color:#ccc;margin-bottom:12px">
+					Commissions earned from products you designed or contributed to, fulfilled by another vendor. Paid out monthly by Loothtool admin.
+				</p>
+				<div style="display:flex;gap:24px;margin-bottom:16px;flex-wrap:wrap">
+					<?php if ( $total_pending > 0 ) : ?>
+					<div style="background:#1a3a3c;border:1px solid #2d6063;border-radius:6px;padding:12px 20px;min-width:160px;text-align:center">
+						<div style="font-size:1.6rem;font-weight:700;color:#c9a84c"><?php echo wp_kses_post( wc_price( $total_pending ) ); ?></div>
+						<div style="font-size:12px;color:#aaa;margin-top:2px">Pending Payout</div>
+					</div>
+					<?php endif; ?>
+					<?php if ( $total_paid > 0 ) : ?>
+					<div style="background:#1a3a3c;border:1px solid #2d6063;border-radius:6px;padding:12px 20px;min-width:160px;text-align:center">
+						<div style="font-size:1.6rem;font-weight:700;color:#2ecc71"><?php echo wp_kses_post( wc_price( $total_paid ) ); ?></div>
+						<div style="font-size:12px;color:#aaa;margin-top:2px">Paid Out (all time)</div>
+					</div>
+					<?php endif; ?>
+				</div>
+				<div style="overflow-x:auto">
+				<table class="dokan-table dokan-table-striped" style="width:100%;font-size:13px">
+					<thead>
+						<tr>
+							<th style="text-align:left">Order</th>
+							<th style="text-align:left">Date</th>
+							<th style="text-align:right">Amount</th>
+							<th style="text-align:left">Order Status</th>
+							<th style="text-align:left">Payout</th>
+						</tr>
+					</thead>
+					<tbody>
+					<?php foreach ( $cv_entries as $e ) :
+						$order_url    = admin_url( 'post.php?post=' . $e['order_id'] . '&action=edit' );
+						$status_label = wc_get_order_status_name( 'wc-' . $e['order_status'] );
+						$date_fmt     = $e['recorded_at'] ? date_i18n( get_option( 'date_format' ), strtotime( $e['recorded_at'] ) ) : '—';
+					?>
+						<tr>
+							<td><a href="<?php echo esc_url( $order_url ); ?>">#<?php echo esc_html( $e['order_id'] ); ?></a></td>
+							<td style="color:#aaa"><?php echo esc_html( $date_fmt ); ?></td>
+							<td style="text-align:right;font-weight:700;color:#2ecc71"><?php echo wp_kses_post( wc_price( $e['amount'] ) ); ?></td>
+							<td style="color:#aaa;font-size:12px"><?php echo esc_html( $status_label ); ?></td>
+							<td>
+								<?php if ( $e['paid'] ) : ?>
+									<span style="color:#2ecc71;font-size:12px">&#10003; Paid</span>
+								<?php else : ?>
+									<span style="color:#c9a84c;font-size:12px">&#9679; Pending</span>
+								<?php endif; ?>
+							</td>
+						</tr>
+					<?php endforeach; ?>
+					</tbody>
+				</table>
+				</div>
+				<?php endif; ?>
+
+				<!-- ── Quick calculator ── -->
 					<h3 style="margin:32px 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.05em">Quick Earnings Calculator</h3>
 					<div style="background:#1a3a3c;border:1px solid #2d6063;border-radius:6px;padding:16px 20px;max-width:400px">
 						<label style="display:block;margin-bottom:8px;font-size:13px;color:#ccc">Enter a sale price:</label>

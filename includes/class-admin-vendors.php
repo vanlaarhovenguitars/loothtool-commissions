@@ -28,6 +28,22 @@ class LT_Comm_Admin_Vendors {
 			'dashicons-money-alt',
 			56
 		);
+		add_submenu_page(
+			'lt-commissions',
+			'Cross-Vendor Payouts',
+			'Cross-Vendor Payouts',
+			'manage_options',
+			'lt-commissions-payouts',
+			[ __CLASS__, 'render_payouts' ]
+		);
+		add_submenu_page(
+			'lt-commissions',
+			'Commission Health Check',
+			'Health Check',
+			'manage_options',
+			'lt-commissions-health',
+			[ __CLASS__, 'render_health_check' ]
+		);
 	}
 
 	public static function enqueue_scripts( $hook ) {
@@ -281,7 +297,7 @@ class LT_Comm_Admin_Vendors {
 									Use custom split rules for this product
 								</label>
 
-								<div class="lt-vend-rules-wrap"<?php if ( ! $is_custom ) echo ' style="display:none"'; ?>>
+								<div class="lt-vend-rules-wrap"<?php if ( ! $is_custom ) echo ' style="display:none"'; /* safe: $is_custom is a boolean from local logic */ ?>>
 									<table class="widefat lt-vend-splits-table"
 										style="max-width:780px;margin-bottom:8px"
 										data-product="<?php echo esc_attr( $pid ); ?>"
@@ -469,18 +485,380 @@ class LT_Comm_Admin_Vendors {
 		}
 
 		global $wpdb;
-		$total = (float) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COALESCE( SUM( CAST( pm.meta_value AS DECIMAL(10,2) ) ), 0 )
-			 FROM {$wpdb->postmeta} pm
-			 INNER JOIN {$wpdb->postmeta} vm
-			     ON vm.post_id = pm.post_id
-			    AND vm.meta_key = '_dokan_vendor_id'
-			    AND vm.meta_value = %d
-			 WHERE pm.meta_key = '_lt_comm_vendor_payout'",
-			$vendor_id
-		) );
+		$orders = wc_get_orders( [
+			'meta_key'   => '_dokan_vendor_id',
+			'meta_value' => $vendor_id,
+			'limit'      => -1,
+			'return'     => 'ids',
+			'status'     => array_keys( wc_get_order_statuses() ),
+		] );
+
+		$total = 0.0;
+		foreach ( $orders as $oid ) {
+			$o = wc_get_order( $oid );
+			if ( $o ) {
+				$payout = (float) $o->get_meta( '_lt_comm_vendor_payout' );
+				$total += $payout;
+			}
+		}
 
 		set_transient( $cache_key, $total, HOUR_IN_SECONDS );
 		return $total;
 	}
+
+	// ── Cross-Vendor Payouts Report ────────────────────────────────────────────
+
+	public static function render_payouts() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		// Handle mark-all-paid action for a vendor.
+		if (
+			isset( $_POST['lt_mark_paid_nonce'] ) &&
+			wp_verify_nonce( sanitize_key( $_POST['lt_mark_paid_nonce'] ), 'lt_mark_paid' ) &&
+			isset( $_POST['vendor_id'] )
+		) {
+			$vendor_id = (int) $_POST['vendor_id'];
+			$all_ids   = wc_get_orders( [
+				'limit'      => -1,
+				'return'     => 'ids',
+				'meta_query' => [ [ 'key' => '_lt_comm_cross_vendor_payouts', 'compare' => 'EXISTS' ] ],
+			] );
+			$count = 0;
+			foreach ( $all_ids as $oid ) {
+				$o       = wc_get_order( (int) $oid );
+				$payouts = $o ? $o->get_meta( '_lt_comm_cross_vendor_payouts' ) : null;
+				if ( ! is_array( $payouts ) ) continue;
+				$changed = false;
+				foreach ( $payouts as &$p ) {
+					if ( (int) $p['vendor_id'] === $vendor_id && empty( $p['paid'] ) ) {
+						$p['paid']    = true;
+						$p['paid_at'] = gmdate( 'c' );
+						$changed      = true;
+						$count++;
+					}
+				}
+				unset( $p );
+				if ( $changed ) {
+					$o->update_meta_data( '_lt_comm_cross_vendor_payouts', $payouts );
+					$o->save();
+				}
+			}
+			wp_redirect( add_query_arg( [ 'page' => 'lt-commissions-payouts', 'marked' => $count ], admin_url( 'admin.php' ) ) );
+			exit;
+		}
+
+		// Aggregate all cross-vendor payouts from order meta.
+		// Use wc_get_orders() so the query works with both HPOS and legacy storage.
+		$order_ids = wc_get_orders( [
+			'limit'      => -1,
+			'return'     => 'ids',
+			'meta_query' => [ [ 'key' => '_lt_comm_cross_vendor_payouts', 'compare' => 'EXISTS' ] ],
+		] );
+
+		$by_vendor = [];
+		foreach ( $order_ids as $oid ) {
+			$o       = wc_get_order( (int) $oid );
+			$payouts = $o ? $o->get_meta( '_lt_comm_cross_vendor_payouts' ) : null;
+			if ( ! is_array( $payouts ) ) {
+				continue;
+			}
+			foreach ( $payouts as $p ) {
+				$vid = (int) $p['vendor_id'];
+				if ( ! isset( $by_vendor[ $vid ] ) ) {
+					$ud                = get_userdata( $vid );
+					$by_vendor[ $vid ] = [
+						'name'   => $ud ? $ud->display_name : "Vendor #{$vid}",
+						'unpaid' => [],
+						'paid'   => [],
+					];
+				}
+				$entry = [
+					'order_id'    => (int) $oid,
+					'amount'      => (float) $p['amount'],
+					'recorded_at' => $p['recorded_at'] ?? '',
+					'paid_at'     => $p['paid_at'] ?? '',
+				];
+				if ( ! empty( $p['paid'] ) ) {
+					$by_vendor[ $vid ]['paid'][] = $entry;
+				} else {
+					$by_vendor[ $vid ]['unpaid'][] = $entry;
+				}
+			}
+		}
+		uasort( $by_vendor, fn( $a, $b ) => strcmp( $a['name'], $b['name'] ) );
+		?>
+		<div class="wrap">
+			<h1>Cross-Vendor Payouts</h1>
+			<p>Commissions owed to secondary vendors (designers, contributors). Pay out manually at month end, then mark all unpaid entries for a vendor as paid.</p>
+			<?php if ( ! empty( $_GET['marked'] ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p><?php echo (int) $_GET['marked']; ?> commission(s) marked as paid.</p></div>
+			<?php endif; ?>
+			<?php if ( empty( $by_vendor ) ) : ?>
+				<p>No cross-vendor commissions recorded yet.</p>
+			<?php else : ?>
+				<?php foreach ( $by_vendor as $vid => $data ) :
+					$unpaid_total = array_sum( array_column( $data['unpaid'], 'amount' ) );
+					$paid_total   = array_sum( array_column( $data['paid'], 'amount' ) );
+				?>
+				<div style="background:#fff;border:1px solid #ccd0d4;border-radius:4px;padding:16px 20px;margin-bottom:24px;max-width:900px">
+					<h2 style="margin:0 0 4px;font-size:16px"><?php echo esc_html( $data['name'] ); ?></h2>
+					<p style="margin:0 0 12px;color:#555;font-size:13px">
+						<strong style="color:#ca4a1f">Unpaid: <?php echo wc_price( $unpaid_total ); ?></strong>
+						<?php if ( $paid_total > 0 ) : ?>
+							&nbsp;|&nbsp;<span style="color:#0a8e27">Paid all-time: <?php echo wc_price( $paid_total ); ?></span>
+						<?php endif; ?>
+					</p>
+					<?php if ( ! empty( $data['unpaid'] ) ) : ?>
+					<table class="widefat striped" style="font-size:13px;margin-bottom:8px">
+						<thead><tr><th>Order</th><th>Date Earned</th><th>Amount</th></tr></thead>
+						<tbody>
+						<?php foreach ( $data['unpaid'] as $e ) :
+							$date_fmt  = $e['recorded_at'] ? date_i18n( get_option( 'date_format' ), strtotime( $e['recorded_at'] ) ) : '-';
+							$order_url = admin_url( 'post.php?post=' . $e['order_id'] . '&action=edit' );
+						?>
+						<tr>
+							<td><a href="<?php echo esc_url( $order_url ); ?>">#<?php echo esc_html( $e['order_id'] ); ?></a></td>
+							<td><?php echo esc_html( $date_fmt ); ?></td>
+							<td><strong><?php echo wc_price( $e['amount'] ); ?></strong></td>
+						</tr>
+						<?php endforeach; ?>
+						</tbody>
+					</table>
+					<form method="post" style="margin-top:8px">
+						<?php wp_nonce_field( 'lt_mark_paid', 'lt_mark_paid_nonce' ); ?>
+						<input type="hidden" name="vendor_id" value="<?php echo esc_attr( $vid ); ?>">
+						<button type="submit" class="button button-primary" onclick="return confirm('Mark all unpaid entries for this vendor as paid?')">Mark All Paid (<?php echo wc_price( $unpaid_total ); ?>)</button>
+					</form>
+					<?php endif; ?>
+					<?php if ( ! empty( $data['paid'] ) ) : ?>
+					<details style="margin-top:8px">
+						<summary style="cursor:pointer;font-size:12px;color:#555">Show paid history (<?php echo count( $data['paid'] ); ?> entries)</summary>
+						<table class="widefat striped" style="font-size:12px;margin-top:8px;color:#888">
+							<thead><tr><th>Order</th><th>Date Earned</th><th>Amount</th><th>Paid On</th></tr></thead>
+							<tbody>
+							<?php foreach ( $data['paid'] as $e ) :
+								$order_url = admin_url( 'post.php?post=' . $e['order_id'] . '&action=edit' );
+								$earned    = $e['recorded_at'] ? date_i18n( get_option( 'date_format' ), strtotime( $e['recorded_at'] ) ) : '-';
+								$paid_on   = $e['paid_at'] ? date_i18n( get_option( 'date_format' ), strtotime( $e['paid_at'] ) ) : '-';
+							?>
+							<tr>
+								<td><a href="<?php echo esc_url( $order_url ); ?>">#<?php echo esc_html( $e['order_id'] ); ?></a></td>
+								<td><?php echo esc_html( $earned ); ?></td>
+								<td><?php echo wc_price( $e['amount'] ); ?></td>
+								<td style="color:#0a8e27">&#10003; <?php echo esc_html( $paid_on ); ?></td>
+							</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					</details>
+					<?php endif; ?>
+				</div>
+				<?php endforeach; ?>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	// ── Commission Health Check & Reconcile ────────────────────────────────────
+
+	public static function render_health_check() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		global $wpdb;
+
+		// Handle reconcile action.
+		if (
+			isset( $_POST['lt_reconcile_nonce'] ) &&
+			wp_verify_nonce( sanitize_key( $_POST['lt_reconcile_nonce'] ), 'lt_reconcile' )
+		) {
+			$fixed = self::reconcile_all_orders();
+			wp_redirect( add_query_arg( [ 'page' => 'lt-commissions-health', 'fixed' => $fixed ], admin_url( 'admin.php' ) ) );
+			exit;
+		}
+
+		// Check Dokan tables exist.
+		$tables_ok = true;
+		$required  = [ 'dokan_orders', 'dokan_order_stats', 'dokan_vendor_balance' ];
+		$missing   = [];
+		foreach ( $required as $t ) {
+			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->prefix . $t ) );
+			if ( ! $exists ) {
+				$tables_ok = false;
+				$missing[] = $wpdb->prefix . $t;
+			}
+		}
+
+		// Get all commission-calculated orders.
+		$order_ids = wc_get_orders( [
+			'limit'      => -1,
+			'return'     => 'ids',
+			'meta_query' => [ [ 'key' => '_lt_comm_calculated_at', 'compare' => 'EXISTS' ] ],
+		] );
+
+		$mismatches = [];
+		foreach ( $order_ids as $oid ) {
+			$order  = wc_get_order( (int) $oid );
+			if ( ! $order ) continue;
+
+			$expected = (float) $order->get_meta( '_lt_comm_vendor_payout' );
+			$vid      = (int) $order->get_meta( '_dokan_vendor_id' );
+			if ( ! $vid || ! $expected ) continue;
+
+			$issues = [];
+
+			// Check dokan_orders.net_amount
+			$net = $wpdb->get_var( $wpdb->prepare(
+				"SELECT net_amount FROM {$wpdb->prefix}dokan_orders WHERE order_id = %d", $oid
+			) );
+			if ( $net !== null && abs( (float) $net - $expected ) > 0.01 ) {
+				$issues[] = 'dokan_orders.net_amount=' . number_format( (float) $net, 2 ) ;
+			}
+
+			// Check dokan_vendor_balance.debit
+			$debit = $wpdb->get_var( $wpdb->prepare(
+				"SELECT debit FROM {$wpdb->prefix}dokan_vendor_balance WHERE trn_id = %d AND vendor_id = %d AND trn_type = 'dokan_orders'",
+				$oid, $vid
+			) );
+			if ( $debit !== null && abs( (float) $debit - $expected ) > 0.01 ) {
+				$issues[] = 'balance.debit=' . number_format( (float) $debit, 2 );
+			}
+
+			// Check dokan_order_stats.vendor_earning
+			$earning = $wpdb->get_var( $wpdb->prepare(
+				"SELECT vendor_earning FROM {$wpdb->prefix}dokan_order_stats WHERE order_id = %d", $oid
+			) );
+			if ( $earning !== null && abs( (float) $earning - $expected ) > 0.01 ) {
+				$issues[] = 'stats.earning=' . number_format( (float) $earning, 2 );
+			}
+
+			if ( ! empty( $issues ) ) {
+				$mismatches[] = [
+					'order_id' => $oid,
+					'expected' => $expected,
+					'issues'   => $issues,
+				];
+			}
+		}
+
+		?>
+		<div class="wrap">
+			<h1>Commission Health Check</h1>
+			<p>Compares our calculated payouts against Dokan's internal tables. Run this after a Dokan update to catch mismatches.</p>
+
+			<?php if ( ! empty( $_GET['fixed'] ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p><?php echo (int) $_GET['fixed']; ?> order(s) reconciled.</p></div>
+			<?php endif; ?>
+
+			<h2>Dokan Tables</h2>
+			<?php if ( $tables_ok ) : ?>
+				<p style="color:#0a8e27">&#10003; All required Dokan tables present (dokan_orders, dokan_order_stats, dokan_vendor_balance)</p>
+			<?php else : ?>
+				<div class="notice notice-error"><p>Missing tables: <strong><?php echo esc_html( implode( ', ', $missing ) ); ?></strong>. A Dokan update may have renamed or removed them. Commission corrections may not work until this is resolved.</p></div>
+			<?php endif; ?>
+
+			<h2>Order Audit (<?php echo count( $order_ids ); ?> orders with commissions)</h2>
+			<?php if ( empty( $mismatches ) ) : ?>
+				<p style="color:#0a8e27">&#10003; All orders match. No mismatches found.</p>
+			<?php else : ?>
+				<div class="notice notice-warning">
+					<p><strong><?php echo count( $mismatches ); ?> mismatch(es) found.</strong> Dokan's tables don't match our calculated payouts.</p>
+				</div>
+				<table class="widefat striped" style="font-size:13px;max-width:900px;margin-bottom:16px">
+					<thead><tr><th>Order</th><th>Expected Payout</th><th>Dokan Has</th></tr></thead>
+					<tbody>
+					<?php foreach ( $mismatches as $m ) :
+						$order_url = admin_url( 'post.php?post=' . $m['order_id'] . '&action=edit' );
+					?>
+					<tr>
+						<td><a href="<?php echo esc_url( $order_url ); ?>">#<?php echo esc_html( $m['order_id'] ); ?></a></td>
+						<td><strong><?php echo wc_price( $m['expected'] ); ?></strong></td>
+						<td style="color:#ca4a1f"><?php echo esc_html( implode( ' | ', $m['issues'] ) ); ?></td>
+					</tr>
+					<?php endforeach; ?>
+					</tbody>
+				</table>
+				<form method="post">
+					<?php wp_nonce_field( 'lt_reconcile', 'lt_reconcile_nonce' ); ?>
+					<button type="submit" class="button button-primary" onclick="return confirm('This will overwrite Dokan\'s values for all mismatched orders. Continue?')">Reconcile All (<?php echo count( $mismatches ); ?> orders)</button>
+				</form>
+			<?php endif; ?>
+
+			<h2 style="margin-top:24px">Hook Status</h2>
+			<p style="font-size:13px;color:#555">
+				<code>correct_vendor_balance</code> registered at priority 999 on <code>woocommerce_order_status_changed</code>:
+				<?php
+				$found = has_action( 'woocommerce_order_status_changed', [ 'LT_Comm_Order_Processor', 'correct_vendor_balance' ] );
+				echo $found ? '<span style="color:#0a8e27">&#10003; Active (priority ' . (int) $found . ')</span>' : '<span style="color:#ca4a1f">&#10007; Not found — commission corrections are NOT running!</span>';
+				?>
+			</p>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Re-sync all commission orders: overwrite Dokan's three tables with our calculated values.
+	 *
+	 * @return int Number of orders fixed.
+	 */
+	private static function reconcile_all_orders() {
+		global $wpdb;
+
+		$order_ids = wc_get_orders( [
+			'limit'      => -1,
+			'return'     => 'ids',
+			'meta_query' => [ [ 'key' => '_lt_comm_calculated_at', 'compare' => 'EXISTS' ] ],
+		] );
+
+		$fixed = 0;
+		foreach ( $order_ids as $oid ) {
+			$order = wc_get_order( (int) $oid );
+			if ( ! $order ) continue;
+
+			$payout   = (float) $order->get_meta( '_lt_comm_vendor_payout' );
+			$platform = (float) $order->get_meta( '_lt_comm_platform_earnings' );
+			$vid      = (int) $order->get_meta( '_dokan_vendor_id' );
+			if ( ! $vid || ! $payout ) continue;
+
+			$changed = false;
+
+			// dokan_orders
+			$net = $wpdb->get_var( $wpdb->prepare(
+				"SELECT net_amount FROM {$wpdb->prefix}dokan_orders WHERE order_id = %d", $oid
+			) );
+			if ( $net !== null && abs( (float) $net - $payout ) > 0.01 ) {
+				$wpdb->update( $wpdb->prefix . 'dokan_orders', [ 'net_amount' => $payout ], [ 'order_id' => $oid ], [ '%f' ], [ '%d' ] );
+				$changed = true;
+			}
+
+			// dokan_vendor_balance
+			$debit = $wpdb->get_var( $wpdb->prepare(
+				"SELECT debit FROM {$wpdb->prefix}dokan_vendor_balance WHERE trn_id = %d AND vendor_id = %d AND trn_type = 'dokan_orders'",
+				$oid, $vid
+			) );
+			if ( $debit !== null && abs( (float) $debit - $payout ) > 0.01 ) {
+				$wpdb->update( $wpdb->prefix . 'dokan_vendor_balance', [ 'debit' => $payout ], [ 'trn_id' => $oid, 'vendor_id' => $vid, 'trn_type' => 'dokan_orders' ], [ '%f' ], [ '%d', '%d', '%s' ] );
+				$changed = true;
+			}
+
+			// dokan_order_stats
+			$earning = $wpdb->get_var( $wpdb->prepare(
+				"SELECT vendor_earning FROM {$wpdb->prefix}dokan_order_stats WHERE order_id = %d", $oid
+			) );
+			if ( $earning !== null && abs( (float) $earning - $payout ) > 0.01 ) {
+				$wpdb->update( $wpdb->prefix . 'dokan_order_stats', [ 'vendor_earning' => $payout, 'admin_commission' => $platform ], [ 'order_id' => $oid ], [ '%f', '%f' ], [ '%d' ] );
+				$changed = true;
+			}
+
+			if ( $changed ) {
+				$fixed++;
+			}
+		}
+
+		return $fixed;
+	}
+
 }

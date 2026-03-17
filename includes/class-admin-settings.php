@@ -61,7 +61,7 @@ class LT_Comm_Admin_Settings {
 								name="lt_comm_platform_percentage"
 								value="<?php echo esc_attr( $pct ); ?>"
 								min="0" max="100" step="0.01" style="width:80px"> %
-							<p class="description">Loothtool's cut from each sale. Applied to item subtotal only — shipping, tax, and payment processing fees are never included in the commission base.</p>
+							<p class="description">Loothtool's cut from each sale. Applied to item subtotal only.</p>
 						</td>
 					</tr>
 					<tr>
@@ -74,10 +74,10 @@ class LT_Comm_Admin_Settings {
 						</td>
 					</tr>
 					<tr>
-						<th>Commission Base</th>
+						<th>Payout Model</th>
 						<td>
-							<strong>Item subtotal only</strong><br>
-							<p class="description">Commissions are always calculated on the product subtotal (after WooCommerce discounts, before tax). Shipping charged to the buyer, sales tax, and payment processing fees (Stripe/PayPal surcharges) are <strong>always excluded</strong> — Loothtool keeps 100% of processing fees separately.</p>
+							<strong>Vendor payout = item commission + shipping + tax &minus; payment processing fees</strong><br>
+							<p class="description">Commission is calculated on item subtotal only. Vendors receive their item commission share plus the full shipping and tax amounts (they purchase the shipping label). Payment processing fees (Stripe/PayPal) are deducted from the vendor payout — Loothtool does not absorb these.</p>
 						</td>
 					</tr>
 					<tr>
@@ -161,17 +161,18 @@ class LT_Comm_Admin_Settings {
 		if ( empty( $orders ) ) return;
 		?>
 		<h2>Recent Commissions</h2>
-		<table class="widefat striped" style="max-width:900px">
+		<table class="widefat striped" style="max-width:1100px">
 			<thead>
 				<tr>
 					<th>Order</th>
 					<th>Date</th>
 					<th>Item Subtotal</th>
-					<th>Vendor Earnings</th>
-					<th>Platform Commission</th>
-					<th>Excl. Shipping</th>
-					<th>Excl. Tax</th>
-					<th>Excl. Fees</th>
+					<th>Item Commission (vendor %)</th>
+					<th>Platform Cut</th>
+					<th>+ Shipping</th>
+					<th>+ Tax</th>
+					<th>&minus; Proc. Fees</th>
+					<th><strong>Vendor Payout</strong></th>
 				</tr>
 			</thead>
 			<tbody>
@@ -185,6 +186,7 @@ class LT_Comm_Admin_Settings {
 					<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_shipping_total' ) ) ); ?></td>
 					<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_tax_total' ) ) ); ?></td>
 					<td><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_processing_fees' ) ) ); ?></td>
+					<td><strong><?php echo wp_kses_post( wc_price( $order->get_meta( '_lt_comm_vendor_payout' ) ) ); ?></strong></td>
 				</tr>
 			<?php endforeach; ?>
 			</tbody>
